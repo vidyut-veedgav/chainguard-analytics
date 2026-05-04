@@ -1,0 +1,15 @@
+[
+  "subscription_tier",
+  "seats_active",
+  "integration_count",
+  "days_since_contract_end",
+  "avg_logins_30d",
+  "total_logins_90d",
+  "avg_dashboards_shared",
+  "avg_feature_usage_score",
+  "days_since_earliest_login",
+  "rate_billing",
+  "rate_bug",
+  "rate_feature_request",
+  "rate_technical"
+]

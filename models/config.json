@@ -1,0 +1,21 @@
+{
+  "model": "xgboost",
+  "trained_at": "2026-05-04T02:09:50+00:00",
+  "n_training_rows": 5000,
+  "n_features": 13,
+  "threshold": 0.1,
+  "beta": 2,
+  "holdout_metrics": {
+    "note": "computed on a single 80/20 stratified split (random_state=1); reported for reference. Final model above is refit on full data.",
+    "n_test_rows": 1000,
+    "n_test_positives": 109,
+    "average_precision": 0.8805,
+    "at_threshold": {
+      "threshold": 0.1,
+      "precision": 0.5783,
+      "recall": 0.8807,
+      "f1": 0.6982,
+      "f2": 0.7973
+    }
+  }
+}
