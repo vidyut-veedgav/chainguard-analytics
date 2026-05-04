@@ -7,7 +7,7 @@ See `docs/overview.md` for the brief, `docs/data_dictionary.md` for fields, and 
 ## Prerequisites
 
 - **Python 3.13** (pinned in `.python-version`)
-- **`uv`** (https://docs.astral.sh/uv/) — there is no `requirements.txt`
+- **`uv`** (https://docs.astral.sh/uv/) — there is no `requirements.txt`, see `pyproject.toml`
 - Source CSVs in `data/raw/` (gitignored — get from the engagement drop):
   - `account_lifecycle_events.csv`
   - `user_engagement_metrics.csv`
