@@ -123,7 +123,7 @@ with dash_col:
         .mark_rule(color='red', strokeDash=[4, 4])
         .encode(x='bin:N')
     )
-    st.altair_chart(chart + threshold_rule, width=True)
+    st.altair_chart(chart + threshold_rule, width='stretch')
 
     st.divider()
 
@@ -133,7 +133,7 @@ with dash_col:
     with left:
         st.subheader('Top 10 highest-risk accounts')
         top = api.top_risk_accounts(n=10)
-        st.dataframe(pd.DataFrame(top), hide_index=True, width=True)
+        st.dataframe(pd.DataFrame(top), hide_index=True, width='stretch')
 
     with right:
         st.subheader('Top 10 features (global importance)')
@@ -156,10 +156,10 @@ with dash_col:
     drivers_col, protectors_col = st.columns(2)
     with drivers_col:
         st.markdown('**Top drivers (push toward churn)**')
-        st.dataframe(pd.DataFrame(explanation['top_drivers']), hide_index=True, width=True)
+        st.dataframe(pd.DataFrame(explanation['top_drivers']), hide_index=True, width='stretch')
     with protectors_col:
         st.markdown('**Top protectors (push toward retention)**')
-        st.dataframe(pd.DataFrame(explanation['top_protectors']), hide_index=True, width=True)
+        st.dataframe(pd.DataFrame(explanation['top_protectors']), hide_index=True, width='stretch')
 
 
 # ---------------------------------------------------------------------------
