@@ -1,346 +1,397 @@
-"""Deterministic feature engineering pipeline.
+"""Feature selection pipeline.
 
-Preprocesses the three source frames (ALE, UEM, SIH) a standard frame indexed by
-`account_id` and consumed by the locked model.
+Implements a four-stage feature selection pipeline
 
-Data-fitted selection (variance / MI / chi^2 / L1 / permutation pruning) is not
-performed here, just preprocessing
+    1. variance prune          (binary dominance, continuous CV / std)
+    2. pairwise correlation    (spearman, dropping the weaker-target side)
+    3. univariate filter       (MI floor AND chi², ANOVA F at bottom quartile)
+    4. model-based selection   (L1 logistic regression + RF permutation importance)
+    5. lock-in                 (in_both AND perm >= floor, minus NUM_TICKET_DROPS)
 
-    pp = build_feature_frame(ale_df, uem_df, sih_df)
-    X  = pp.drop(columns=['account_status']).reindex(columns=feature_columns)
+    # TODO learn how MI, chi^2 and ANOVA F work
+    # TODO learn how RF permutation importance works
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import chi2, f_classif, mutual_info_classif
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from src.constants import (
-    ALE_TIMESTAMP_DROPS,
-    ALE_TIMEZONE_COLUMN_MAP,
-    BINARY_EQUALITY_COLS,
-    BOOLEAN_INT_COLS,
-    DEFAULT_SNAPSHOT_DATE,
-    ID_DROPS_POST_MERGE,
-    LEAKAGE_DROPS_POST_MERGE,
-    NOTIF_PREF_MAP,
-    ONE_HOT_COLS,
-    ORDINAL_MAPS,
-    PRESERVE_NAN_COLS,
-    PRIMARY_ID,
-    PRIORITY_MAP,
-    SENTIMENT_MAP,
-    SIH_TIMEZONE_COLUMN_MAP,
-    THRESHOLD_BANDS,
-    UEM_TIMEZONE_COLUMN_MAP,
+    BINARY_DOMINANCE_THRESHOLD,
+    CORRELATION_THRESHOLD,
+    CV_THRESHOLD,
+    FEATURE_COLUMNS_PATH,
+    MI_FLOOR,
+    NUM_TICKET_DROPS,
+    PERM_FLOOR,
+    POST_PREPROCESSING_LEAKAGE_DROPS,
+    RANDOM_STATE,
+    STD_THRESHOLD,
+    TARGET,
+    TEST_SIZE,
+    UNIVARIATE_QUANTILE,
 )
 
 # ---------------------------------------------------------------------------
-# Per-source preprocessing
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _timestamps_to_durations(df: pd.DataFrame, column_map: dict[str, str], reference_date: pd.Timestamp) -> None:
-    # Add signed integer day-offset columns in-place. Source columns are preserved
-    for src_col, dst_col in column_map.items():
-        df[dst_col] = (reference_date - df[src_col]).dt.days
+def _is_binary(s: pd.Series) -> bool:
+    # dtype-based detection misses int-encoded booleans and one-hots.
+    return set(s.dropna().unique()).issubset({0, 1})
 
 
-def _preprocess_ale(ale: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
-    ale = ale.copy()
-    ale['region'] = ale['region'].fillna('NA') # pandas parses the string 'NA' as null — restore North America region.
-    _timestamps_to_durations(ale, ALE_TIMEZONE_COLUMN_MAP, snapshot)
-    return ale
+def _split_binary_continuous(features: pd.DataFrame) -> tuple[list[str], list[str]]:
+    # Classify features as either binary or continuous
+    binary_cols, continuous_cols = [], []
+    for c in features.columns:
+        (binary_cols if _is_binary(features[c]) else continuous_cols).append(c)
+    return binary_cols, continuous_cols
 
 
-def _preprocess_uem(uem: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
-    uem = uem.copy()
-    _timestamps_to_durations(uem, UEM_TIMEZONE_COLUMN_MAP, snapshot)
-    return uem
-
-
-def _preprocess_sih(sih: pd.DataFrame, snapshot: pd.Timestamp) -> pd.DataFrame:
-    sih = sih.copy()
-    _timestamps_to_durations(sih, SIH_TIMEZONE_COLUMN_MAP, snapshot)
-    return sih
+def _median_impute(features: pd.DataFrame) -> pd.DataFrame:
+    # For diagnostics since some features carry NaNs as in-built signal (e.g. recency for accounts with no tickets)
+    return features.fillna(features.median(numeric_only=True))
 
 
 # ---------------------------------------------------------------------------
-# Aggregations
+# Stage 1 — Variance prune
 # ---------------------------------------------------------------------------
 
-def _aggregate_uem(uem: pd.DataFrame) -> pd.DataFrame:
-    # Building aggregate fields for the uem frame
+def _filter_variance(features: pd.DataFrame) -> list[str]:
+    # Filter columns based on variance. Super low variance gives low predictive signal
+    # Using cv = sd / mu because it's scale aware. mu 1000, st 0.001 is very stable but mu 0.001 and st 0.001 is not
+    # Out of the box sklearn would flatten to 1 and kill thresholding
+    binary_cols, continuous_cols = _split_binary_continuous(features)
 
-    group = uem.groupby(PRIMARY_ID) # Returns a pandas groupby object 
+    binary_share = features[binary_cols].apply(lambda s: max(s.mean(), 1 - s.mean()))
+    binary_drops = binary_share[binary_share > BINARY_DOMINANCE_THRESHOLD].index.tolist()
 
-    # TODO missing the `invited` column from data dictionary, could add here if curveball includes it
-    # TODO Extract the activity_counters into a helper method for uem and sih
-    counts = pd.DataFrame({
-        'num_users':             group.size(),
-        'num_active_users':      group['user_status'].apply(lambda s: (s == 'active').sum()),
-        'num_deactivated_users': group['user_status'].apply(lambda s: (s == 'deactivated').sum()),
-    })
+    mu = features[continuous_cols].mean().abs()
+    sd = features[continuous_cols].std()
+    cv = sd / mu.replace(0, np.nan)
+    cont_drops = cv[(cv < CV_THRESHOLD) | (sd < STD_THRESHOLD)].index.tolist()
 
-    # One-hot-encoding the user_role column
-    roles = pd.get_dummies(uem['user_role']).groupby(uem[PRIMARY_ID]).sum()
-    roles.columns = [f'num_{c}s' for c in roles.columns]
+    return binary_drops + cont_drops
 
-    # Creating aggregate fields for numerical columns measuring user activity
-    activity_counters = {
-        'login_count_30d':       ('total_logins_30d',         'avg_logins_30d'),
-        'login_count_90d':       ('total_logins_90d',         'avg_logins_90d'),
-        'sessions_count_30d':    ('total_sessions_30d',       'avg_sessions_30d'),
-        'reports_generated_30d': ('total_reports_30d',        'avg_reports_30d'),
-        'dashboards_created':    ('total_dashboards_created', 'avg_dashboards_created'),
-        'dashboards_shared':     ('total_dashboards_shared',  'avg_dashboards_shared'),
-        'exports_count_30d':     ('total_exports_30d',        'avg_exports_30d'),
-    }
-    activity_sums = pd.DataFrame({total: group[src].sum()  for src, (total, _)   in activity_counters.items()})
-    activity_avgs = pd.DataFrame({avg:   group[src].mean() for src, (_,     avg) in activity_counters.items()})
 
-    fus = group['feature_usage_score'].agg(
-        avg_feature_usage_score='mean',
-        min_feature_usage_score='min',
-        max_feature_usage_score='max',
+# ---------------------------------------------------------------------------
+# Stage 2 — Pairwise correlation prune
+# ---------------------------------------------------------------------------
+
+def _prune_correlation(
+    # Measure the correlation between different features to find redundancies
+    # Using spearman correlation over pearson because it handles monotonic relationships instead of just linear 
+    # and is more robust with outliers since it uses data ranks instead of raw data
+    features: pd.DataFrame,
+    y: pd.Series,
+    method: str = 'spearman',
+    threshold: float = CORRELATION_THRESHOLD,
+) -> list[str]:
+    X_imp = _median_impute(features)
+    corr = X_imp.corr(method=method).abs()
+    target_corr = X_imp.corrwith(y, method=method).abs()
+
+    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    to_drop: set[str] = set()
+    for col in upper.columns:
+        for row, val in upper[col].dropna().items():
+            if val <= threshold or row in to_drop or col in to_drop:
+                continue
+            # Drop the side with weaker target correlation; the other survives.
+            loser = row if target_corr[row] < target_corr[col] else col
+            to_drop.add(loser)
+    return sorted(to_drop)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Univariate filters (ANOVA F, chi², mutual information)
+# ---------------------------------------------------------------------------
+
+def _rank_univariate(
+    features: pd.DataFrame,
+    y: pd.Series,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    # Evaluates each feature independently against the target and returns three importance scores
+    # ANOVA F: tests how different the average values of each class in a feature are (variance between variables is greated than variance within variable --> reject null)
+    # Chi-square: tests whether a binary feature and the target are independent
+    # Mutual information: noisier but a helpful filter for extremes, measures linear and nonlinear dependencies / interactions
+    X_imp = _median_impute(features)
+    binary_cols, continuous_cols = _split_binary_continuous(X_imp)
+
+    # ANOVA F on continuous (chi² requires non-negative inputs; some continuous cols can be negative)
+    f_stat, _ = f_classif(X_imp[continuous_cols], y)
+    anova = pd.Series(f_stat, index=continuous_cols, name='anova_F')
+
+    # chi² on binary one-hots (already non-negative by construction)
+    chi_stat, _ = chi2(X_imp[binary_cols], y)
+    chi = pd.Series(chi_stat, index=binary_cols, name='chi2')
+
+    # Mutual information across everything; flag binaries as discrete for kNN-density estimator
+    mi = pd.Series(
+        mutual_info_classif(
+            X_imp, y,
+            discrete_features=[c in binary_cols for c in X_imp.columns],
+            random_state=RANDOM_STATE,
+        ),
+        index=X_imp.columns, name='mutual_info',
     )
-
-    def _weighted_session_duration(grp):
-        # Weighting average session count by 30d activity (favors recent activity)
-        w, v = grp['sessions_count_30d'], grp['avg_session_duration_minutes']
-        tot = w.sum()
-        return (v * w).sum() / tot if tot > 0 else np.nan
-    session_dur = group.apply(_weighted_session_duration).rename('avg_session_duration_minutes')
-
-    # Aggregating TRUEs from boolean fields
-    bool_sums = pd.DataFrame({
-        'num_api_key_active':        group['api_key_active'].sum(),
-        'num_mobile_users':          group['mobile_app_user'].sum(),
-        'num_onboarding_completed':  group['onboarding_completed'].sum(),
-        'num_certification_earned':  group['certification_earned'].sum(),
-        'num_beta_features_enabled': group['beta_features_enabled'].sum(),
-    })
-
-    # Calculating spread (variability) in relevant nominal categorical fields
-    spread = pd.DataFrame({
-        'n_distinct_browsers':  group['browser_type'].nunique(),
-        'n_distinct_os':        group['operating_system'].nunique(),
-        'n_distinct_languages': group['language_preference'].nunique(),
-    })
-
-    # One-hot-encoding nominal categorical groups 
-    browser_oh = pd.get_dummies(uem['browser_type'],       prefix='num').groupby(uem[PRIMARY_ID]).sum()
-    os_oh      = pd.get_dummies(uem['operating_system'],   prefix='num').groupby(uem[PRIMARY_ID]).sum()
-    lang_oh    = pd.get_dummies(uem['language_preference'], prefix='num_lang').groupby(uem[PRIMARY_ID]).sum()
-
-    notif_ord = uem['notification_preference'].map(NOTIF_PREF_MAP)
-    notif = pd.DataFrame({
-        'total_notification_pref': notif_ord.groupby(uem[PRIMARY_ID]).sum(),
-        'avg_notification_pref':   notif_ord.groupby(uem[PRIMARY_ID]).mean(),
-    })
-
-    # Creating spread fields for timezone offset
-    tz = pd.DataFrame({
-        'tz_nunique': group['timezone_offset'].nunique(),
-        'tz_std':     group['timezone_offset'].std(),
-    })
-
-    profile = group['profile_completeness_pct'].mean().rename('avg_profile_completeness_pct')
-
-    # Ranges for days_since_ fields
-    recency = pd.DataFrame({
-        'days_since_latest_login':           group['days_since_last_login'].min(),
-        'days_since_earliest_login':         group['days_since_last_login'].max(),
-        'days_since_latest_user_creation':   group['days_since_user_creation'].min(),
-        'days_since_earliest_user_creation': group['days_since_user_creation'].max(),
-    })
-
-    # Constructing aggregate columns from UEM frame. Row size should be 5000
-    return pd.concat(
-        [counts, roles, activity_sums, activity_avgs, fus, session_dur, bool_sums, spread,
-         browser_oh, os_oh, lang_oh, notif, tz, profile, recency],
-        axis=1,
-    )
+    return anova, chi, mi
 
 
-def _aggregate_sih(sih: pd.DataFrame) -> pd.DataFrame:
-    # Building aggregate fields for the sih frame 
-
-    group = sih.groupby(PRIMARY_ID)
-
-    counts = pd.DataFrame({
-        'num_tickets':         group.size(),
-        'num_ticket_creators': group['user_id'].nunique(),
-        'num_distinct_agents': group['agent_id'].nunique(),
-    })
-
-    prio_ord = sih['ticket_priority'].map(PRIORITY_MAP)
-    sent_ord = sih['ticket_sentiment'].map(SENTIMENT_MAP)
-    ordinal = pd.DataFrame({
-        'max_priority':  prio_ord.groupby(sih[PRIMARY_ID]).max(),
-        'min_priority':  prio_ord.groupby(sih[PRIMARY_ID]).min(),
-        'avg_priority':  prio_ord.groupby(sih[PRIMARY_ID]).mean(),
-        'max_sentiment': sent_ord.groupby(sih[PRIMARY_ID]).max(),
-        'min_sentiment': sent_ord.groupby(sih[PRIMARY_ID]).min(),
-        'avg_sentiment': sent_ord.groupby(sih[PRIMARY_ID]).mean(),
-    })
-
-    # One-hot-encoding ticket category fields
-    cat_oh    = pd.get_dummies(sih['ticket_category']).groupby(sih[PRIMARY_ID])
-    cat_sums  = cat_oh.sum().add_prefix('num_')
-    cat_rates = cat_oh.mean().add_prefix('rate_')
-
-    resolution = group['resolution_time_hours'].agg(
-        max_resolution_hours='max',
-        avg_resolution_hours='mean',
-        total_resolution_hours='sum',
-    )
-
-    satrat = sih['satisfaction_rating']
-    satrat_df = pd.DataFrame({
-        'num_satrat_responses': satrat.notna().groupby(sih[PRIMARY_ID]).sum(),
-        'satrat_response_rate': satrat.notna().groupby(sih[PRIMARY_ID]).mean(),
-        'num_low_satrat':       satrat.lt(2.5).groupby(sih[PRIMARY_ID]).sum(),
-        'num_high_satrat':      satrat.gt(2.5).groupby(sih[PRIMARY_ID]).sum(),
-    })
-
-    bools = pd.DataFrame({
-        'total_escalated':               group['escalated'].sum(),
-        'rate_escalated':                group['escalated'].mean(),
-        'total_sla_breach':              group['sla_breach'].sum(),
-        'total_cancellation_requested':  group['cancellation_requested'].sum(),
-        'rate_cancellation_requested':   group['cancellation_requested'].mean(),
-        'total_retention_offer_made':    group['retention_offer_made'].sum(),
-        'total_account_pause_requested': group['account_pause_requested'].sum(),
-        'total_downgrade_requested':     group['downgrade_requested'].sum(),
-    })
-
-    reopened = group['reopened_count'].agg(total_reopened='sum', max_reopened='max')
-
-    text_counts = pd.DataFrame({
-        'num_cancellation_reasons': sih['cancellation_reason'].notna().groupby(sih[PRIMARY_ID]).sum(),
-        'num_competitor_mentions':  sih['competitor_mentioned'].notna().groupby(sih[PRIMARY_ID]).sum(),
-    })
-
-    # One-hot-encoding the support channel
-    ch_oh    = pd.get_dummies(sih['channel']).groupby(sih[PRIMARY_ID])
-    ch_sums  = ch_oh.sum().add_prefix('num_')
-    ch_rates = ch_oh.mean().add_prefix('rate_')
-
-    activity_counters = {
-        'interaction_count':      ('total_interactions', 'avg_interactions'),
-        'kb_articles_referenced': ('total_kb_articles',  'avg_kb_articles'),
-    }
-    activity_sums = pd.DataFrame({total: group[src].sum()  for src, (total, _)   in activity_counters.items()})
-    activity_avgs = pd.DataFrame({avg:   group[src].mean() for src, (_,     avg) in activity_counters.items()})
-
-    # internal_category is being phased out per the data dictionary. Serving time data will not match train if used
-    if sih['internal_category'].isna().mean() < 0.5:
-        ic_oh = pd.get_dummies(sih['internal_category'], prefix='num_internal').groupby(sih[PRIMARY_ID]).sum()
-    else:
-        ic_oh = pd.DataFrame(index=group.size().index)
-
-    # Handling days_since_ fields
-    recency = pd.DataFrame({
-        'days_since_latest_ticket_creation':   group['days_since_ticket_creation'].min(),
-        'days_since_earliest_ticket_creation': group['days_since_ticket_creation'].max(),
-        'days_since_latest_resolution':        group['days_since_resolution'].min(),
-        'days_since_earliest_resolution':      group['days_since_resolution'].max(),
-    })
-
-    days = sih['days_since_ticket_creation']
-    windows = pd.DataFrame({
-        'n_tickets_30d': days.le(30).groupby(sih[PRIMARY_ID]).sum(),
-        'n_tickets_90d': days.le(90).groupby(sih[PRIMARY_ID]).sum(),
-    })
-
-    # Returning aggregated columns from sih (row size should be 5000)
-    return pd.concat(
-        [counts, ordinal, cat_sums, cat_rates, resolution, satrat_df, bools, reopened,
-         text_counts, ch_sums, ch_rates, activity_sums, activity_avgs, ic_oh, recency, windows],
-        axis=1,
-    )
-
-# ---------------------------------------------------------------------------
-# Merge + post-merge cleaning
-# ---------------------------------------------------------------------------
-
-def _merge(base: pd.DataFrame, merge_col: str, agg_frames: list[pd.DataFrame]) -> pd.DataFrame:
-    # Iteratively left-merge each aggregate frame onto base on `merge_col`.
-    # Always join on account_id — account_uuid is NULL for non-EU / pre-2023 rows
-    # (data dictionary; CLAUDE.md).
-    merged_frame = base
-    for frame in agg_frames:
-        merged_frame = merged_frame.merge(frame, how='left', on=merge_col)
-    return merged_frame
+def _univariate_drops(
+    anova: pd.Series,
+    chi: pd.Series,
+    mi: pd.Series,
+    mi_floor: float = MI_FLOOR,
+    quantile: float = UNIVARIATE_QUANTILE,
+) -> list[str]:
+    # Hard drop only when MI agrees with the applicable secondary test since it's noisier
+    # Features need to fail both a nonlinear and a linear/independence test to be dropped
+    anova_q = anova.quantile(quantile)
+    chi_q = chi.quantile(quantile)
+    drops = []
+    for c in mi.index:
+        if mi[c] >= mi_floor:
+            continue
+        if c in chi.index and chi[c] < chi_q:
+            drops.append(c)
+        elif c in anova.index and anova[c] < anova_q:
+            drops.append(c)
+    return drops
 
 
-def _zero_fill_after_merge(pp_df: pd.DataFrame, columns) -> None:
-    # Replace NaN with 0 in place for `columns`. Use after left-merging aggregate
-    # frames where missing-on-the-right means "zero of that thing" (zero tickets,
-    # zero sessions, single-user account, ...). Caller is responsible for excluding
-    # columns where NaN is semantically meaningful (see PRESERVE_NAN_COLS).
-    pp_df[columns] = pp_df[columns].fillna(0)
-
-
-def _post_merge_clean(pp_df: pd.DataFrame) -> None:
-    assert pp_df[PRIMARY_ID].is_unique, "row inflation from merge"
-
-    # Threshold bands run BEFORE drops so a band's source column can be dropped as leakage.
-    for output_col, (source_col, threshold) in THRESHOLD_BANDS.items():
-        pp_df[output_col] = (pp_df[source_col] >= threshold).astype(int)
-
-    pp_df.drop(
-        columns=[*ID_DROPS_POST_MERGE, *LEAKAGE_DROPS_POST_MERGE, *ALE_TIMESTAMP_DROPS],
-        inplace=True,
-        errors='ignore',
-    )
-
-    for col, positive in BINARY_EQUALITY_COLS.items():
-        pp_df[col] = (pp_df[col] == positive).astype(int)
-
-    for col, mapping in ORDINAL_MAPS.items():
-        pp_df[col] = pp_df[col].map(mapping)
-
-    for col in ONE_HOT_COLS:
-        oh = pd.get_dummies(pp_df[col], prefix=col).astype(int)
-        pp_df.drop(columns=[col], inplace=True)
-        for new_col in oh.columns:
-            pp_df[new_col] = oh[new_col].values
-
-    pp_df[BOOLEAN_INT_COLS] = pp_df[BOOLEAN_INT_COLS].astype(int)
+def _build_rank_table(anova: pd.Series, chi: pd.Series, mi: pd.Series) -> pd.DataFrame:
+    # Construct a ranking of features that independently correlate with target
+    cols = mi.index
+    table = pd.DataFrame(index=cols)
+    table['anova_F_rank'] = anova.reindex(cols).rank(ascending=False)
+    table['chi2_rank']    = chi.reindex(cols).rank(ascending=False)
+    table['mi_rank']      = mi.rank(ascending=False)
+    table['mi']           = mi
+    table['avg_rank']     = table[['anova_F_rank', 'chi2_rank', 'mi_rank']].mean(axis=1)
+    return table.sort_values('avg_rank')
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Stage 4 — Model-based selection (two estimators, two views)
 # ---------------------------------------------------------------------------
 
-def build_feature_frame(
-    ale_df: pd.DataFrame,
-    uem_df: pd.DataFrame,
-    sih_df: pd.DataFrame,
-    snapshot_date: pd.Timestamp | str | None = None,
-) -> pd.DataFrame:
-    """Raw three-table input -> one-row-per-account feature frame.
+def _fit_l1_selector(
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_te: pd.DataFrame,
+    y_te: pd.Series,
+) -> tuple[pd.Series, float]:
+    # Trains a logistic regression model with L1 regularization to assess feature importance
+    # Use L1 reg. because it sends feature weights get sent to 0 instead of tiny floats, acting as a built-in feature selector
+    # L1 needs scale-comparable inputs so fitting scaler on train set only is important to aviod leakage
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_te_s = scaler.transform(X_te)
 
-    Returns a preprocessed dataframe with all derived/encoded columns and a binarized target.
-    Returned columns are a superset of the locked feature list. Callers should reindex
-    based on models/feature_columns.json
+    l1 = LogisticRegressionCV(
+        Cs=10, penalty='l1', solver='saga', scoring='roc_auc',
+        cv=5, max_iter=5000, class_weight='balanced',
+        n_jobs=-1, random_state=RANDOM_STATE,
+    )
+    l1.fit(X_tr_s, y_tr)
+    coef = pd.Series(l1.coef_.ravel(), index=X_tr.columns, name='l1_coef')
+    auc = roc_auc_score(y_te, l1.predict_proba(X_te_s)[:, 1])
+    return coef, auc
 
-    Input frames are not mutated — each is copied once on entry.
+
+def _fit_rf_permutation(
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_te: pd.DataFrame,
+    y_te: pd.Series,
+) -> tuple[pd.Series, float]:
+    # Trains a random forest classifier then measuring feature importance using permutation importance
+    # Perm. imporance takes a feature, shuffles its values, and measure how much model performance drops (bigger drops = more important features)
+    rf = RandomForestClassifier(
+        n_estimators=400, max_depth=None, min_samples_leaf=20,
+        class_weight='balanced', n_jobs=-1, random_state=RANDOM_STATE,
+    )
+    rf.fit(X_tr, y_tr)
+    auc = roc_auc_score(y_te, rf.predict_proba(X_te)[:, 1])
+    perm = permutation_importance(
+        rf, X_te, y_te,
+        n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1, scoring='roc_auc',
+    )
+    importance = pd.Series(perm.importances_mean, index=X_tr.columns, name='perm_importance')
+    return importance, auc
+
+
+def _combine_scores(l1_coef: pd.Series, perm_importance: pd.Series) -> pd.DataFrame:
+    # Combining results from both models
+    combined = pd.DataFrame({
+        'l1_coef':         l1_coef,
+        'l1_abs':          l1_coef.abs(),
+        'perm_importance': perm_importance,
+    })
+    combined['in_l1']   = combined['l1_abs'] > 1e-6
+    combined['in_perm'] = combined['perm_importance'] > 0
+    combined['in_both'] = combined['in_l1'] & combined['in_perm']
+    return combined.sort_values(['in_both', 'perm_importance', 'l1_abs'], ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — Lock-in
+# ---------------------------------------------------------------------------
+
+def _lock_features(
+    combined: pd.DataFrame,
+    perm_floor: float = PERM_FLOOR,
+    exclusions: Iterable[str] | None = None,
+) -> list[str]:
+    # Create a final filtered list of features
+    exclusions = set(exclusions if exclusions is not None else NUM_TICKET_DROPS)
+    keepers = combined[combined['in_both'] & (combined['perm_importance'] >= perm_floor)].index.tolist()
+    keepers = [c for c in keepers if c not in exclusions]
+    return sorted(keepers)
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+def _write_feature_columns(features: list[str], path: Path, force: bool = False) -> None:
+    # Persists final feature list to specified path, refusing for divergent columns for protection
+    if path.exists() and not force:
+        existing = _read_feature_columns(path)
+        if existing != features:
+            only_new = sorted(set(features) - set(existing))
+            only_old = sorted(set(existing) - set(features))
+            raise ValueError(
+                f"refusing to overwrite {path} with a divergent feature list. "
+                f"only in new: {only_new or '<none>'}; only in old: {only_old or '<none>'}. "
+                f"Pass force=True to confirm re-derivation, or persist_path=None to skip writing."
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w') as fh:
+        json.dump(features, fh, indent=2)
+
+
+def _read_feature_columns(path: Path) -> list[str]:
+    with path.open() as fh:
+        return json.load(fh)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def run_selection_pipeline(
+    pp_df: pd.DataFrame,
+    target: str = TARGET,
+    persist_path: Path | str | None = FEATURE_COLUMNS_PATH,
+    random_state: int = RANDOM_STATE,
+    force: bool = False,
+) -> dict:
+    """Run the four-stage selection funnel against a candidate frame.
+
+    Operates on a working copy; does not mutate input. Splits stratified on y
+    for the model-based stage so train/test class balance matches the full data.
+
+    Persistence is conservative: when `persist_path` points to an existing file
+    whose contents differ from the new locked list, the call raises ValueError
+    unless `force=True`. This prevents a silent rewrite from breaking inference
+    on a model that was trained against the prior locked list. Pass `force=True`
+    for an intentional re-derivation or `persist_path=None` to compute without writing.
+
+    Returns a diagnostic dict:
+
+        {
+          'stage_drops':     {'leakage': [...], 'variance': [...], 'correlation': [...], 'univariate': [...]},
+          'rank_table':      DataFrame,        # post-univariate ranking (anova/chi²/mi)
+          'scores':          DataFrame,        # l1_coef, perm_importance, in_l1, in_perm, in_both
+          'auc':             {'l1': float, 'rf': float},
+          'locked_features': [...],
+        }
     """
-    snapshot = pd.Timestamp(snapshot_date) if snapshot_date is not None else DEFAULT_SNAPSHOT_DATE
+    work = pp_df.copy()
+    features = work.drop(columns=[target])
+    y = work[target]
 
-    ale = _preprocess_ale(ale_df, snapshot)
-    uem = _preprocess_uem(uem_df, snapshot)
-    sih = _preprocess_sih(sih_df, snapshot)
+    # Known leakage drops applied before any scoring so they cannot dominate the selection stages.
+    leakage_drops = [c for c in POST_PREPROCESSING_LEAKAGE_DROPS if c in features.columns]
+    features = features.drop(columns=leakage_drops)
 
-    agg_frames = [_aggregate_uem(uem), _aggregate_sih(sih)]
+    variance_drops = _filter_variance(features)
+    features = features.drop(columns=variance_drops)
 
-    pp_df = _merge(ale, merge_col=PRIMARY_ID, agg_frames=agg_frames)
+    correlation_drops = _prune_correlation(features, y)
+    features = features.drop(columns=correlation_drops)
 
-    agg_cols = [c for f in agg_frames for c in f.columns]
-    zero_fill_cols = [c for c in agg_cols if c not in PRESERVE_NAN_COLS]
-    _zero_fill_after_merge(pp_df, zero_fill_cols)
+    anova, chi, mi = _rank_univariate(features, y)
+    univariate_drops = _univariate_drops(anova, chi, mi)
+    features = features.drop(columns=univariate_drops)
 
-    _post_merge_clean(pp_df)
-    return pp_df
+    rank_table = _build_rank_table(
+        anova.drop(univariate_drops, errors='ignore'),
+        chi.drop(univariate_drops, errors='ignore'),
+        mi.drop(univariate_drops, errors='ignore'),
+    )
+
+    X_imp = _median_impute(features)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_imp, y, test_size=TEST_SIZE, stratify=y, random_state=random_state,
+    )
+    l1_coef, l1_auc = _fit_l1_selector(X_tr, y_tr, X_te, y_te)
+    perm_importance, rf_auc = _fit_rf_permutation(X_tr, y_tr, X_te, y_te)
+    scores = _combine_scores(l1_coef, perm_importance)
+
+    locked = _lock_features(scores)
+
+    if persist_path is not None:
+        _write_feature_columns(locked, Path(persist_path), force=force)
+
+    return {
+        'stage_drops': {
+            'leakage': leakage_drops,
+            'variance': variance_drops,
+            'correlation': correlation_drops,
+            'univariate': univariate_drops,
+        },
+        'rank_table': rank_table,
+        'scores': scores,
+        'auc': {'l1': l1_auc, 'rf': rf_auc},
+        'locked_features': locked,
+    }
+
+
+def apply_locked_features(
+    pp_df: pd.DataFrame,
+    feature_columns: list[str] | str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Reindex a preprocessed frame onto the locked feature set.
+
+    `feature_columns` can be a list (used directly), a path (loaded as JSON),
+    or None (loads from FEATURE_COLUMNS_PATH). reindex() is intentional: any
+    column missing from `pp_df` becomes a NaN column and trips the assert
+    """
+    if feature_columns is None:
+        cols = _read_feature_columns(FEATURE_COLUMNS_PATH)
+    elif isinstance(feature_columns, (str, Path)):
+        cols = _read_feature_columns(Path(feature_columns))
+    else:
+        cols = list(feature_columns)
+
+    X = pp_df.reindex(columns=cols)
+    missing = X.columns[X.isna().any()].tolist()
+    assert not missing, f"locked features missing or NaN at serve time: {missing}"
+    y = pp_df[TARGET]
+    return X, y

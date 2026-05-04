@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 # Join key across all source frames + per-account aggregation key.
@@ -107,3 +109,68 @@ BINARY_EQUALITY_COLS = {
 ORDINAL_MAPS = {
     'subscription_tier': SUBSCRIPTION_TIER_ORDINAL,
 }
+
+# ---------------------------------------------------------------------------
+# Feature selection thresholds (consumed by src/features.py)
+# ---------------------------------------------------------------------------
+
+# Variance prune. Binary cols where one class exceeds this share are near-constant.
+BINARY_DOMINANCE_THRESHOLD = 0.99
+# Continuous cols below either floor are near-constant. CV is scale-aware,
+# std catches degenerate-zero-variance columns where the mean is also ~0.
+CV_THRESHOLD = 1e-3
+STD_THRESHOLD = 1e-9
+
+# Pairwise correlation prune. Spearman is intentional — catches monotonic
+# redundancy (totals vs averages) without assuming linearity.
+CORRELATION_THRESHOLD = 0.9
+
+# Univariate hard-drop. A feature must fail BOTH the nonlinear test (MI < floor)
+# AND its applicable linear/independence test (chi² for binary, ANOVA F for
+# continuous) at this quantile before it is dropped. Conservative by design.
+MI_FLOOR = 1e-3
+UNIVARIATE_QUANTILE = 0.25
+
+# Model-based lock-in. Permutation importance below this floor contributes
+# < 0.1% AUC and is treated as noise.
+PERM_FLOOR = 1e-3
+
+# Train/test split for the model-based stage.
+TEST_SIZE = 0.25
+RANDOM_STATE = 0
+
+# rate_* siblings carry the same signal more cleanly than these num_* counts;
+# excluded at lock-in regardless of L1 / permutation scores to avoid
+# double-counting collinear constructs.
+NUM_TICKET_DROPS = ['num_billing', 'num_bug', 'num_technical', 'num_feature_request']
+
+# Persisted artifact written by the selection pipeline and read back at serve time.
+FEATURE_COLUMNS_PATH = Path('models/feature_columns.json')
+
+# Curated leakage drops applied AFTER deterministic preprocessing but BEFORE
+# selection. These are EDA decisions (distribution checks + leakage audit) — not
+# fitted, but they require the post-merge frame to identify. Without dropping
+# these, the model-based stage trivially achieves AUC ≈ 1.0 and the lock-in
+# collapses to a single perfect-separator (e.g., health_score_band).
+#
+# - health_score_band: encodes account_health_score (algorithm proxies churn risk)
+# - risk_flag: CS-team churn assessment, NULL for ~50% of accounts
+# - days_since_last_activity: post-churn drift (median 63 churned vs 18 active)
+# - num_competitor_mentions: exit-conversation flag (100% zero active vs 78% nonzero churned)
+# - total_/rate_cancellation_*, num_cancellation*, total_retention_offer_made,
+#   total_account_pause_requested, total_downgrade_requested: SIH CS-conversation
+#   artifacts that telegraph the outcome.
+POST_PREPROCESSING_LEAKAGE_DROPS = [
+    'health_score_band',
+    'risk_flag',
+    'days_since_last_activity',
+    'num_competitor_mentions',
+    'total_cancellation_requested',
+    'rate_cancellation_requested',
+    'num_cancellation',
+    'rate_cancellation',
+    'num_cancellation_reasons',
+    'total_retention_offer_made',
+    'total_account_pause_requested',
+    'total_downgrade_requested',
+]
