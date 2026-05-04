@@ -28,7 +28,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from src.constants import (
+from src.config import (
     BINARY_DOMINANCE_THRESHOLD,
     CORRELATION_THRESHOLD,
     CV_THRESHOLD,

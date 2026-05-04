@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # Join key across all source frames + per-account aggregation key.
@@ -174,3 +175,31 @@ POST_PREPROCESSING_LEAKAGE_DROPS = [
     'total_account_pause_requested',
     'total_downgrade_requested',
 ]
+
+# ---------------------------------------------------------------------------
+# Training defaults (consumed by src/predict.py)
+# ---------------------------------------------------------------------------
+# Training-stage split is intentionally distinct from the selection-stage split
+# above (TEST_SIZE / RANDOM_STATE). They answer different questions, so they
+# don't share a constant.
+
+MODEL_WEIGHTS_PATH = Path('models/xgb.json')
+MODEL_CONFIG_PATH  = Path('models/config.json')
+
+TRAINING_TEST_SIZE    = 0.2
+TRAINING_RANDOM_STATE = 1
+
+# F2 — recall weighted 4x precision. Catching churners matters more than false
+# alarms; matches the threshold (0.10) baked into models/config.json.
+DEFAULT_BETA       = 2.0
+DEFAULT_THRESHOLDS = np.arange(0.10, 0.91, 0.05)
+
+# EDA-locked XGBoost hyperparameters (notebook cells 53/57). Phase-2 swap is a
+# `model_factory=` override at the call site, not a mutation of this dict.
+XGB_HYPERPARAMS = {
+    'n_estimators':      100,
+    'learning_rate':     0.1,
+    'use_label_encoder': False,
+    'eval_metric':       'logloss',
+    'random_state':      1,
+}

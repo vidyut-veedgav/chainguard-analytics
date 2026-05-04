@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.constants import (
+from src.config import (
     ALE_TIMESTAMP_DROPS,
     ALE_TIMEZONE_COLUMN_MAP,
     BINARY_EQUALITY_COLS,
