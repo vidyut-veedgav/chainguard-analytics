@@ -293,8 +293,12 @@ def _post_merge_clean(pp_df: pd.DataFrame) -> None:
     for output_col, (source_col, threshold) in THRESHOLD_BANDS.items():
         pp_df[output_col] = (pp_df[source_col] >= threshold).astype(int)
 
+    # Promote account_id to the index so the row-account mapping survives the ID drops.
+    # Required by the api layer (src/api.py) for per-account lookup.
+    pp_df.set_index(PRIMARY_ID, inplace=True)
     pp_df.drop(
-        columns=[*ID_DROPS_POST_MERGE, *LEAKAGE_DROPS_POST_MERGE, *ALE_TIMESTAMP_DROPS],
+        columns=[c for c in (*ID_DROPS_POST_MERGE, *LEAKAGE_DROPS_POST_MERGE, *ALE_TIMESTAMP_DROPS)
+                 if c != PRIMARY_ID],
         inplace=True,
         errors='ignore',
     )

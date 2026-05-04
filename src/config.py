@@ -183,7 +183,7 @@ POST_PREPROCESSING_LEAKAGE_DROPS = [
 # above (TEST_SIZE / RANDOM_STATE). They answer different questions, so they
 # don't share a constant.
 
-MODEL_WEIGHTS_PATH = Path('models/xgb.json')
+MODEL_WEIGHTS_PATH = Path('models/xgb_churn.json')
 MODEL_CONFIG_PATH  = Path('models/config.json')
 
 TRAINING_TEST_SIZE    = 0.2
