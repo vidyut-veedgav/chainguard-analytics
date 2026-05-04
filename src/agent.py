@@ -1,12 +1,23 @@
 """Agent to handle conversational UI
 
-Gemini agent has access to public API to answer questions from chat interface
+Gemini agent has access to public API to answer questions from chat interface.
+
+Auth: pick one path via .env (loaded automatically at import):
+    - VERTEX_PROJECT (+ optional VERTEX_LOCATION) → Vertex AI via gcloud ADC
+    - GEMINI_API_KEY                              → direct Gemini API
+
+Vertex wins when both are set.
 """
 
+import os
+
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 from src import api
+
+load_dotenv()
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +171,7 @@ You must justify all of your responses to the user. You provide clear and interp
 You also talk like a pirate.
 """
 
-# Lazy client — Vertex auth resolution can block at construction, so we defer
+# Lazy client — auth resolution can block at construction, so we defer
 # it to the first ask() call. Dashboard consumers that never call ask() pay
 # nothing.
 
@@ -169,11 +180,25 @@ _client = None
 
 def _get_client():
     global _client
-    if _client is None:
+    if _client is not None:
+        return _client
+
+    vertex_project = os.environ.get('VERTEX_PROJECT')
+    api_key = os.environ.get('GEMINI_API_KEY')
+
+    if vertex_project:
         _client = genai.Client(
             vertexai=True,
-            project='kepler-labs-491817',
-            location='us-central1',
+            project=vertex_project,
+            location=os.environ.get('VERTEX_LOCATION', 'us-central1'),
+        )
+    elif api_key:
+        _client = genai.Client(api_key=api_key)
+    else:
+        raise RuntimeError(
+            "No Gemini credentials found. Set one of the following in .env:\n"
+            "  VERTEX_PROJECT (+ optional VERTEX_LOCATION) for Vertex AI via gcloud ADC, or\n"
+            "  GEMINI_API_KEY for the direct Gemini API."
         )
     return _client
 

@@ -1,5 +1,7 @@
 # Project-specific files
 data/raw
+data/profiles
+data/preprocessed
 docs
 
 # Byte-compiled / optimized / DLL files
