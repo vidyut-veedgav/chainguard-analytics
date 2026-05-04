@@ -210,6 +210,35 @@ def top_risk_accounts(n: int = 5) -> list[dict]:
     ]
 
 
+def top_k_accounts(k: int) -> dict:
+    """Capacity-aware variant of `top_risk_accounts`.
+
+    Returns the top K active accounts plus the `implied_threshold` — the predicted
+    probability at position K. Companion to the fixed-threshold view in
+    `portfolio_summary().n_high_risk`: pick whichever framing matches the binding
+    constraint (capacity vs. risk cutoff). See `docs/api_module_guide.md` for the
+    consumption pattern.
+
+    `k` is capped at the size of the active book.
+    """
+    active = _active_subset(_load_scoring_frame())
+    k = max(0, min(k, len(active)))
+    top = active.nlargest(k, _PROB_COL) if k else active.iloc[:0]
+    implied_threshold = float(top[_PROB_COL].iloc[-1]) if k else None
+    return {
+        'k':                 k,
+        'implied_threshold': implied_threshold,
+        'accounts': [
+            {
+                'account_id':      str(idx),
+                'probability':     float(row[_PROB_COL]),
+                'predicted_label': _label(int(row[_PRED_COL])),
+            }
+            for idx, row in top.iterrows()
+        ],
+    }
+
+
 def feature_importance(top_k: int = 10) -> list[dict]:
     """Global feature importance from the XGBoost model (gain), descending."""
     model = _load_model()
