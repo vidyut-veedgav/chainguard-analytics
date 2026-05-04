@@ -43,6 +43,7 @@ from src.config import (
     TEST_SIZE,
     UNIVARIATE_QUANTILE,
 )
+from src._validation import require_columns, require_nonempty
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -322,6 +323,8 @@ def run_selection_pipeline(
           'locked_features': [...],
         }
     """
+    require_nonempty(pp_df, where="run_selection_pipeline")
+    require_columns(pp_df, [target], where="run_selection_pipeline")
     work = pp_df.copy()
     features = work.drop(columns=[target])
     y = work[target]
@@ -390,8 +393,13 @@ def apply_locked_features(
     else:
         cols = list(feature_columns)
 
+    require_columns(pp_df, [TARGET], where="apply_locked_features")
     X = pp_df.reindex(columns=cols)
     missing = X.columns[X.isna().any()].tolist()
-    assert not missing, f"locked features missing or NaN at serve time: {missing}"
+    if missing:
+        raise ValueError(
+            f"apply_locked_features: locked features missing or all-NaN at serve time: {missing}. "
+            f"Likely cause: pp_df schema drift vs. feature_columns.json."
+        )
     y = pp_df[TARGET]
     return X, y

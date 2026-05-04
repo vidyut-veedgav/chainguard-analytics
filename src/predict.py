@@ -45,6 +45,7 @@ from src.config import (
     TRAINING_TEST_SIZE,
     XGB_HYPERPARAMS,
 )
+from src._validation import require_in_range, require_nonempty
 
 
 def default_model_factory() -> XGBClassifier:
@@ -122,7 +123,11 @@ def train(
           'random_state': int,            # echoed for tune_threshold's note
         }
     """
+    require_nonempty(X, where="train")
+    require_in_range("test_size", test_size, 0.0, 1.0, where="train")
     y_arr = np.asarray(y).ravel()
+    if len(X) != len(y_arr):
+        raise ValueError(f"train: X has {len(X)} rows, y has {len(y_arr)} — must match")
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y_arr, test_size=test_size, stratify=y_arr, random_state=random_state,
     )
@@ -156,7 +161,12 @@ def tune_threshold(
           'holdout_metrics': dict,              # shape matches models/config.json["holdout_metrics"]
         }
     """
+    if beta <= 0:
+        raise ValueError(f"tune_threshold: beta must be > 0, got {beta}")
     y_true = np.asarray(y_true).ravel()
+    y_proba = np.asarray(y_proba).ravel()
+    if len(y_true) != len(y_proba):
+        raise ValueError(f"tune_threshold: y_true ({len(y_true)}) and y_proba ({len(y_proba)}) must match")
     sweep = _sweep_thresholds(y_true, y_proba, thresholds, beta)
     threshold = _best_threshold(sweep, beta)
     y_hat = (y_proba >= threshold).astype(int)

@@ -30,6 +30,7 @@ from src.config import (
     MODEL_CONFIG_PATH,
     MODEL_WEIGHTS_PATH,
 )
+from src._validation import require_positive_int
 from src.features import apply_locked_features
 from src.preprocessing import build_feature_frame
 
@@ -160,6 +161,7 @@ def explain_account(account_id: str, top_k: int = 3) -> dict:
     contributions); `top_protectors` are the top_k pushing toward retention.
     Returning both lets the agent answer "why high" or "why low" symmetrically.
     """
+    require_positive_int("top_k", top_k, where="explain_account")
     row = _row_or_raise(account_id)
     contribs = _load_pred_contribs().loc[account_id]
     feature_cols = list(_load_feature_columns())
@@ -199,6 +201,7 @@ def top_risk_accounts(n: int = 5) -> list[dict]:
     not actionable risk. Use `get_account_risk(id)` for per-account lookups
     regardless of status.
     """
+    require_positive_int("n", n, where="top_risk_accounts")
     top = _active_subset(_load_scoring_frame()).nlargest(n, _PROB_COL)
     return [
         {
@@ -221,8 +224,10 @@ def top_k_accounts(k: int) -> dict:
 
     `k` is capped at the size of the active book.
     """
+    require_positive_int("k", k, where="top_k_accounts", allow_zero=True)
     active = _active_subset(_load_scoring_frame())
-    k = max(0, min(k, len(active)))
+    # Cap k at active-book size (capacity-aware); negative k is rejected above.
+    k = min(k, len(active))
     top = active.nlargest(k, _PROB_COL) if k else active.iloc[:0]
     implied_threshold = float(top[_PROB_COL].iloc[-1]) if k else None
     return {
@@ -241,6 +246,7 @@ def top_k_accounts(k: int) -> dict:
 
 def feature_importance(top_k: int = 10) -> list[dict]:
     """Global feature importance from the XGBoost model (gain), descending."""
+    require_positive_int("top_k", top_k, where="feature_importance")
     model = _load_model()
     feature_cols = list(_load_feature_columns())
     importances = pd.Series(model.feature_importances_, index=feature_cols)
@@ -301,6 +307,7 @@ def probability_distribution(bins: int = 20) -> dict:
     huge tall-right-tail spike (their probabilities cluster near 1.0) that
     visually drowns out the actionable distribution.
     """
+    require_positive_int("bins", bins, where="probability_distribution")
     active = _active_subset(_load_scoring_frame())
     counts, edges = np.histogram(active[_PROB_COL].values, bins=bins, range=(0.0, 1.0))
     return {

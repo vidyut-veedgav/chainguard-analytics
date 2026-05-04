@@ -38,6 +38,7 @@ from src.config import (
     THRESHOLD_BANDS,
     UEM_TIMEZONE_COLUMN_MAP,
 )
+from src._validation import require_columns, require_nonempty
 
 # ---------------------------------------------------------------------------
 # Per-source preprocessing
@@ -286,12 +287,19 @@ def _zero_fill_after_merge(pp_df: pd.DataFrame, columns) -> None:
     pp_df[columns] = pp_df[columns].fillna(0)
 
 
-def _post_merge_clean(pp_df: pd.DataFrame) -> None:
-    assert pp_df[PRIMARY_ID].is_unique, "row inflation from merge"
+def _post_merge_clean(pp_df: pd.DataFrame) -> pd.DataFrame:
+    if not pp_df[PRIMARY_ID].is_unique:
+        n_dupes = int(pp_df[PRIMARY_ID].duplicated().sum())
+        raise ValueError(f"_post_merge_clean: row inflation from merge — {n_dupes} duplicated {PRIMARY_ID} values")
 
     # Threshold bands run BEFORE drops so a band's source column can be dropped as leakage.
-    for output_col, (source_col, threshold) in THRESHOLD_BANDS.items():
-        pp_df[output_col] = (pp_df[source_col] >= threshold).astype(int)
+    # Build all band columns at once and concat to avoid block-fragmentation on a wide frame.
+    bands = pd.DataFrame(
+        {output_col: (pp_df[source_col] >= threshold).astype(int)
+         for output_col, (source_col, threshold) in THRESHOLD_BANDS.items()},
+        index=pp_df.index,
+    )
+    pp_df = pd.concat([pp_df, bands], axis=1)
 
     # Promote account_id to the index so the row-account mapping survives the ID drops.
     # Required by the api layer (src/api.py) for per-account lookup.
@@ -309,13 +317,13 @@ def _post_merge_clean(pp_df: pd.DataFrame) -> None:
     for col, mapping in ORDINAL_MAPS.items():
         pp_df[col] = pp_df[col].map(mapping)
 
-    for col in ONE_HOT_COLS:
-        oh = pd.get_dummies(pp_df[col], prefix=col).astype(int)
-        pp_df.drop(columns=[col], inplace=True)
-        for new_col in oh.columns:
-            pp_df[new_col] = oh[new_col].values
+    # Build all dummy frames first, drop the source columns, then concat once.
+    oh_frames = [pd.get_dummies(pp_df[col], prefix=col).astype(int) for col in ONE_HOT_COLS]
+    pp_df.drop(columns=list(ONE_HOT_COLS), inplace=True)
+    pp_df = pd.concat([pp_df, *oh_frames], axis=1)
 
     pp_df[BOOLEAN_INT_COLS] = pp_df[BOOLEAN_INT_COLS].astype(int)
+    return pp_df
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +343,10 @@ def build_feature_frame(
     columns and a binarized target. Returned columns are a superset of the locked feature
     list. Callers should reindex based on models/feature_columns.json
     """
-    snapshot = pd.Timestamp(snapshot_date) if snapshot_date is not None else DEFAULT_SNAPSHOT_DATE
+    try:
+        snapshot = pd.Timestamp(snapshot_date) if snapshot_date is not None else DEFAULT_SNAPSHOT_DATE
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"build_feature_frame: snapshot_date {snapshot_date!r} not parseable as Timestamp") from e
 
     ale_df = pd.read_csv(ale_path, parse_dates=list(ALE_TIMEZONE_COLUMN_MAP))
     uem_df = pd.read_csv(uem_path, parse_dates=list(UEM_TIMEZONE_COLUMN_MAP))
@@ -353,5 +364,4 @@ def build_feature_frame(
     zero_fill_cols = [c for c in agg_cols if c not in PRESERVE_NAN_COLS]
     _zero_fill_after_merge(pp_df, zero_fill_cols)
 
-    _post_merge_clean(pp_df)
-    return pp_df
+    return _post_merge_clean(pp_df)

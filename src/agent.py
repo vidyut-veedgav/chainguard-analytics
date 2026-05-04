@@ -149,6 +149,10 @@ SYSTEM_INSTRUCTIONS = """
 You are a helpful assistant that helps users identify, rank, and explain churn risk among their customer accounts.
 You have access to various tools (functions built from an underlying machine learning system) that you must use to do this. 
 
+Make sure to use the tool that best matches the user's need. 
+
+For example, if a user asks: "What is the probability that Account ACC000456 churns?", you should use the 'get_account_risk' tool. 
+
 Do NOT hallucinate. All of your answers to the users MUST be grounded in the return values from tools you decide to you.
 
 You must justify all of your responses to the user. You provide clear and interpretable explanations to both technical and nontechnical stakeholders. 
@@ -156,27 +160,37 @@ You must justify all of your responses to the user. You provide clear and interp
 You also talk like a pirate.
 """
 
-# Initialize the agent
-client = genai.Client(
-    vertexai=True,
-    project='kepler-labs-491817',
-    location='us-central1',
-)
+# Lazy client — Vertex auth resolution can block at construction, so we defer
+# it to the first ask() call. Dashboard consumers that never call ask() pay
+# nothing.
 
-MODEL = 'gemini-2.0-flash-001'
+_client = None
 
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(
+            vertexai=True,
+            project='kepler-labs-491817',
+            location='us-central1',
+        )
+    return _client
+
+
+MODEL = 'gemini-2.5-flash'
 
 def ask(message: str, chat=None) -> tuple[str, object]:
-    # Send a user message and resolve any tool calls until a text answer comes back.
+    # Send a user message and resolve any tool calls until an answer comes back
     if chat is None:
-        chat = client.chats.create(
+        chat = _get_client().chats.create(
             model=MODEL,
             config=types.GenerateContentConfig(
                 tools=[tool],
                 system_instruction=SYSTEM_INSTRUCTIONS
             ),
         )
-
+    # Response and tool use logic
     response = chat.send_message(message)
     while True:
         calls = [p.function_call for p in response.candidates[0].content.parts if p.function_call]
