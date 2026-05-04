@@ -47,16 +47,6 @@ uv run streamlit run app/dashboard.py --server.address 0.0.0.0
 
 **Open the Network URL Streamlit prints, not `localhost`.** First-call latency is ~2–3s while the model loads and SHAP runs; everything after is cached.
 
-## Retrain
-
-Training is driven by `notebooks/eda.ipynb`, which calls `src/preprocessing.py` → `src/features.py` → `src/predict.py` and overwrites `models/{xgb_churn.json, config.json, feature_columns.json}`.
-
-```bash
-uv run jupyter lab notebooks/eda.ipynb  # run all cells
-```
-
-`notebooks/test_api.ipynb` smoke-tests `src/api.py` against the saved artifacts.
-
 ## Layout
 
 ```

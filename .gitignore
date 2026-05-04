@@ -4,6 +4,10 @@ data/profiles
 data/preprocessed
 docs
 
+# Agents
+.claude
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
