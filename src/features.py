@@ -33,6 +33,7 @@ from src.config import (
     CORRELATION_THRESHOLD,
     CV_THRESHOLD,
     FEATURE_COLUMNS_PATH,
+    FORCE_INCLUDE_FEATURES,
     MI_FLOOR,
     NUM_TICKET_DROPS,
     PERM_FLOOR,
@@ -301,6 +302,7 @@ def run_selection_pipeline(
     persist_path: Path | str | None = FEATURE_COLUMNS_PATH,
     random_state: int = RANDOM_STATE,
     force: bool = False,
+    force_include: Iterable[str] | None = None,
 ) -> dict:
     """Run the four-stage selection funnel against a candidate frame.
 
@@ -313,6 +315,14 @@ def run_selection_pipeline(
     on a model that was trained against the prior locked list. Pass `force=True`
     for an intentional re-derivation or `persist_path=None` to compute without writing.
 
+    `force_include` is a business-override lever: columns named here are unioned
+    into the locked set after `_lock_features` runs, regardless of whether they
+    survived the funnel. When None, falls back to `FORCE_INCLUDE_FEATURES` from
+    config. The funnel still scores them where possible, so `stage_drops` and
+    `scores` record what would have happened without the override. Each forced
+    column must exist in `pp_df` and must not also appear in
+    `POST_PREPROCESSING_LEAKAGE_DROPS` — both conditions raise.
+
     Returns a diagnostic dict:
 
         {
@@ -321,10 +331,31 @@ def run_selection_pipeline(
           'scores':          DataFrame,        # l1_coef, perm_importance, in_l1, in_perm, in_both
           'auc':             {'l1': float, 'rf': float},
           'locked_features': [...],
+          'forced':          [...],            # columns added via force_include / FORCE_INCLUDE_FEATURES
         }
     """
     require_nonempty(pp_df, where="run_selection_pipeline")
     require_columns(pp_df, [target], where="run_selection_pipeline")
+
+    forced = list(force_include) if force_include is not None else list(FORCE_INCLUDE_FEATURES)
+    if forced:
+        forced_missing = [c for c in forced if c not in pp_df.columns]
+        if forced_missing:
+            raise KeyError(
+                f"run_selection_pipeline: force_include columns absent from pp_df: {forced_missing}. "
+                f"Engineer them in preprocessing.py before forcing into the locked set."
+            )
+        if target in forced:
+            raise ValueError(
+                f"run_selection_pipeline: refusing to force-include the target column ({target})."
+            )
+        forced_leak = [c for c in forced if c in POST_PREPROCESSING_LEAKAGE_DROPS]
+        if forced_leak:
+            raise ValueError(
+                f"run_selection_pipeline: refusing to force-include columns also listed in "
+                f"POST_PREPROCESSING_LEAKAGE_DROPS: {forced_leak}. Resolve the contradiction in config.py."
+            )
+
     work = pp_df.copy()
     features = work.drop(columns=[target])
     y = work[target]
@@ -358,6 +389,7 @@ def run_selection_pipeline(
     scores = _combine_scores(l1_coef, perm_importance)
 
     locked = _lock_features(scores)
+    locked = sorted(set(locked) | set(forced))
 
     if persist_path is not None:
         _write_feature_columns(locked, Path(persist_path), force=force)
@@ -373,6 +405,7 @@ def run_selection_pipeline(
         'scores': scores,
         'auc': {'l1': l1_auc, 'rf': rf_auc},
         'locked_features': locked,
+        'forced': forced,
     }
 
 
@@ -395,7 +428,10 @@ def apply_locked_features(
 
     require_columns(pp_df, [TARGET], where="apply_locked_features")
     X = pp_df.reindex(columns=cols)
-    missing = X.columns[X.isna().any()].tolist()
+    # reindex() fabricates an all-NaN column for any name absent from pp_df —
+    # that's the schema-drift signal. Sparse NaN within an existing column is
+    # legitimate (see PRESERVE_NAN_COLS) and handled natively by XGBoost.
+    missing = X.columns[X.isna().all()].tolist()
     if missing:
         raise ValueError(
             f"apply_locked_features: locked features missing or all-NaN at serve time: {missing}. "

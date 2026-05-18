@@ -4,6 +4,7 @@
   "avg_logins_30d",
   "days_since_contract_end",
   "integration_count",
+  "mrr",
   "rate_billing",
   "rate_bug",
   "rate_feature_request",

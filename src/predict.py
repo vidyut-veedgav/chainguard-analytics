@@ -228,14 +228,19 @@ def save_artifacts(
 ) -> None:
     """Persist model weights + config.json (schema matches existing models/config.json).
 
-    Note: assumed an XGBoost style json, could be different for an sklearn model
+    `model_name='xgboost'` uses XGBoost's native JSON format; any other value
+    falls back to joblib. The same key is the dispatch read by `src.api._load_model`.
     """
     model_path  = Path(model_path)
     config_path = Path(config_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    estimator.save_model(model_path)
+    if model_name == 'xgboost':
+        estimator.save_model(model_path)
+    else:
+        import joblib
+        joblib.dump(estimator, model_path)
 
     config = {
         'model':           model_name,

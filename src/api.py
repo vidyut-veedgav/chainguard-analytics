@@ -16,6 +16,7 @@ Subsequent calls have cache hits and return JSON objects
 
 from __future__ import annotations
 
+import asyncio
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -47,14 +48,42 @@ _BIAS_COL = '_bias'
 
 
 # ---------------------------------------------------------------------------
+# Realtime state (held outside lru_cache so apply_events can update pp_df
+# without breaking the caching contract on _load_scoring_frame).
+# ---------------------------------------------------------------------------
+
+_pp_df_holder: dict[str, pd.DataFrame | None] = {"frame": None}
+_update_counter: int = 0
+_retrain_task: "asyncio.Task[None] | None" = None
+
+
+def get_pp_df() -> pd.DataFrame:
+    """Cached pp_df; builds from raw CSVs on first access.
+
+    Public so notebooks and inspectors can read the realtime-augmented frame
+    without poking at module state.
+    """
+    if _pp_df_holder["frame"] is None:
+        _pp_df_holder["frame"] = build_feature_frame(
+            _DATA_PATHS["ale"], _DATA_PATHS["uem"], _DATA_PATHS["sih"]
+        )
+    return _pp_df_holder["frame"]
+
+
+# ---------------------------------------------------------------------------
 # Caching strategy
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
-def _load_model() -> XGBClassifier:
-    model = XGBClassifier()
-    model.load_model(MODEL_WEIGHTS_PATH)
-    return model
+def _load_model():
+    """Dispatched on config['model']: 'xgboost' uses native JSON; anything else uses joblib."""
+    name = _load_config().get('model', 'xgboost')
+    if name == 'xgboost':
+        model = XGBClassifier()
+        model.load_model(MODEL_WEIGHTS_PATH)
+        return model
+    import joblib
+    return joblib.load(MODEL_WEIGHTS_PATH)
 
 
 @lru_cache(maxsize=1)
@@ -77,8 +106,13 @@ def _load_scoring_frame() -> pd.DataFrame:
     accounts are kept in the frame so per-account lookups still work, but the
     portfolio-level methods filter them out — they're not actionable risk.
     """
-    pp = build_feature_frame(_DATA_PATHS['ale'], _DATA_PATHS['uem'], _DATA_PATHS['sih'])
-    X, y = apply_locked_features(pp)
+    pp = get_pp_df()
+    # Route the feature list through the lru_cache (not disk) so the served
+    # tuple (feature_list, model, config) stays internally consistent during
+    # a retrain — _retrain_sync writes feature_columns.json before saving the
+    # new model, and a serving call landing in that window would otherwise
+    # mismatch new columns against the old model.
+    X, y = apply_locked_features(pp, feature_columns=list(_load_feature_columns()))
     model = _load_model()
     threshold = _load_config()['threshold']
     proba = model.predict_proba(X)[:, 1]
@@ -314,4 +348,84 @@ def probability_distribution(bins: int = 20) -> dict:
         'bin_edges': [float(e) for e in edges],
         'counts':    [int(c) for c in counts],
         'threshold': float(_load_config()['threshold']),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Realtime ingestion + background retraining
+# ---------------------------------------------------------------------------
+
+def _invalidate_prediction_caches() -> None:
+    # pp_df changed: served scoring + SHAP must refresh, but model/config/locked list are untouched.
+    _load_scoring_frame.cache_clear()
+    _load_pred_contribs.cache_clear()
+
+
+def _invalidate_all_caches() -> None:
+    # A retrain rewrote feature_columns.json + xgb_churn.json + config.json on disk.
+    _load_model.cache_clear()
+    _load_config.cache_clear()
+    _load_feature_columns.cache_clear()
+    _invalidate_prediction_caches()
+
+
+def _retrain_sync() -> None:
+    # CPU-bound; called via run_in_executor so the event loop stays responsive.
+    from src.features import run_selection_pipeline
+    from src.predict import train, tune_threshold, fit_final, save_artifacts
+
+    pp_df = get_pp_df()
+    run_selection_pipeline(pp_df, force=True)
+    X, y = apply_locked_features(pp_df)
+    fit = train(X, y)
+    tuned = tune_threshold(
+        fit['y_test'], fit['proba'],
+        test_size=fit['test_size'],
+        random_state=fit['random_state'],
+    )
+    final = fit_final(X, y)
+    save_artifacts(
+        final,
+        threshold=tuned['threshold'],
+        holdout_metrics=tuned['holdout_metrics'],
+        n_features=X.shape[1],
+        n_training_rows=len(X),
+    )
+
+
+async def _retrain() -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _retrain_sync)
+    _invalidate_all_caches()
+
+
+async def apply_realtime_events(events: list[dict]) -> dict:
+    """Apply a batch of realtime events; schedule a retrain after N batches.
+
+    One call = one update (regardless of batch size). On the call that trips
+    RETRAIN_EVERY_N_UPDATES, a background asyncio task runs the full
+    selection + training pipeline. Caches invalidate atomically when it
+    finishes, so served predictions stay internally consistent throughout.
+    """
+    global _update_counter, _retrain_task
+    from src.realtime import apply_events
+    from src.config import RETRAIN_EVERY_N_UPDATES
+
+    pp_df = get_pp_df()
+    _pp_df_holder["frame"] = apply_events(pp_df, events)
+    _invalidate_prediction_caches()
+    _update_counter += 1
+
+    triggered = False
+    if _update_counter >= RETRAIN_EVERY_N_UPDATES:
+        # If a retrain is still in flight, leave the counter alone — next call trips it again.
+        if _retrain_task is None or _retrain_task.done():
+            _retrain_task = asyncio.create_task(_retrain())
+            _update_counter = 0
+            triggered = True
+
+    return {
+        'n_events_applied':      len(events),
+        'updates_until_retrain': max(0, RETRAIN_EVERY_N_UPDATES - _update_counter),
+        'retrain_triggered':     triggered,
     }

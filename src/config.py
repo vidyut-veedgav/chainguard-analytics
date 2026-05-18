@@ -173,8 +173,17 @@ POST_PREPROCESSING_LEAKAGE_DROPS = [
     'num_cancellation_reasons',
     'total_retention_offer_made',
     'total_account_pause_requested',
-    'total_downgrade_requested',
+    'total_downgrade_requested'
 ]
+
+# Business-mandated inclusions that bypass the selection funnel. Symmetric to
+# POST_PREPROCESSING_LEAKAGE_DROPS: that list drops downward through the gates,
+# this list overrides upward past them. Each entry must exist in pp_df at
+# selection time (engineer it in preprocessing.py first) and must not also
+# appear in POST_PREPROCESSING_LEAKAGE_DROPS — run_selection_pipeline raises on
+# both conditions. Use sparingly: every forced feature degrades events-per-
+# parameter and shifts fit budget away from selector-validated features.
+FORCE_INCLUDE_FEATURES: list[str] = []
 
 # ---------------------------------------------------------------------------
 # Training defaults (consumed by src/predict.py)
@@ -203,3 +212,86 @@ XGB_HYPERPARAMS = {
     'eval_metric':       'logloss',
     'random_state':      1,
 }
+
+# ---------------------------------------------------------------------------
+# Real-time event ingestion (consumed by src/realtime.py)
+# ---------------------------------------------------------------------------
+# Declarative contract: each event type -> the pp_df columns its strategy in
+# realtime.py is allowed to mutate. Enforced post-hoc by _validate_postcondition.
+#
+# Class split (see docs/realtime_guide.md when written):
+#   - Class A "absolute state" (integration_count, seats_active/purchased):
+#     events update the existing column in place. No window/temporal-anchor
+#     conflict.
+#   - Class B "activity": new rt_* columns only. Snapshot-era windowed columns
+#     (total_logins_30d, n_tickets_30d, days_since_latest_login, ...) are NOT
+#     written from events — their temporal anchor (DEFAULT_SNAPSHOT_DATE) is
+#     incompatible with realtime "now." Feature selection sees both variants
+#     on the next retrain and picks the predictive one.
+#
+# rt_* columns are initialized to 0 in build_feature_frame so feature selection
+# always sees the same schema regardless of event volume.
+EVENT_MAPPING = {
+    # --- User activity ---
+    'login': [
+        'rt_total_logins',
+        'rt_days_since_latest_login',
+        'rt_distinct_users_logged_in',
+    ],
+    'logout': [
+        'rt_total_logouts',
+        'rt_total_session_minutes',
+    ],
+    'feature_usage': [
+        'rt_total_feature_uses',
+        'rt_distinct_features_used',
+    ],
+    'report_generated': [
+        'rt_total_reports',
+        'rt_total_report_rows',
+    ],
+    'dashboard_created': [
+        'rt_total_dashboards_created',
+        'rt_total_widgets_created',
+    ],
+
+    # --- Support ---
+    'support_ticket_created': [
+        'rt_num_tickets',
+        'rt_num_billing', 'rt_rate_billing',
+        'rt_num_bug', 'rt_rate_bug',
+        'rt_num_technical', 'rt_rate_technical',
+        'rt_num_feature_request', 'rt_rate_feature_request',
+        'rt_max_priority', 'rt_min_priority', 'rt_avg_priority',
+        'rt_max_sentiment', 'rt_min_sentiment', 'rt_avg_sentiment',
+        'rt_days_since_latest_ticket_creation',
+    ],
+    'support_ticket_resolved': [
+        'rt_num_resolved',
+        'rt_max_resolution_hours', 'rt_avg_resolution_hours', 'rt_total_resolution_hours',
+        'rt_num_satrat_responses', 'rt_satrat_response_rate',
+        'rt_num_low_satrat', 'rt_num_high_satrat',
+        'rt_days_since_latest_resolution',
+    ],
+
+    # --- Billing ---
+    'payment_processed': [
+        'rt_num_payments_processed',
+        'rt_total_payment_amount',
+    ],
+    'payment_failed': [
+        'rt_num_payments_failed',
+        'rt_total_failed_amount',
+    ],
+
+    # --- Account state (Class A: existing columns, in-place) ---
+    'integration_added':   ['integration_count'],
+    'integration_removed': ['integration_count'],
+    'seat_added':   ['seats_active', 'seats_purchased'],
+    'seat_removed': ['seats_active', 'seats_purchased'],
+}
+
+# Retraining cadence: each call to apply_realtime_events counts as one update.
+# After this many updates, a background asyncio task reruns feature selection
+# + training. Set higher in production (bursty traffic) and lower for demos.
+RETRAIN_EVERY_N_UPDATES = 5

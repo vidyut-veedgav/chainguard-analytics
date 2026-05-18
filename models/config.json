@@ -1,21 +1,21 @@
 {
   "model": "xgboost",
-  "trained_at": "2026-05-04T02:09:50+00:00",
+  "trained_at": "2026-05-18T17:58:47+00:00",
   "n_training_rows": 5000,
-  "n_features": 13,
+  "n_features": 12,
   "threshold": 0.1,
-  "beta": 2,
+  "beta": 2.0,
   "holdout_metrics": {
     "note": "computed on a single 80/20 stratified split (random_state=1); reported for reference. Final model above is refit on full data.",
     "n_test_rows": 1000,
     "n_test_positives": 109,
-    "average_precision": 0.8805,
+    "average_precision": 0.8977,
     "at_threshold": {
       "threshold": 0.1,
-      "precision": 0.5783,
-      "recall": 0.8807,
-      "f1": 0.6982,
-      "f2": 0.7973
+      "precision": 0.6101,
+      "recall": 0.8899,
+      "f1": 0.7239,
+      "f2": 0.8151
     }
   }
 }

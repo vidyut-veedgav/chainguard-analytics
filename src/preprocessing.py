@@ -25,6 +25,7 @@ from src.config import (
     BINARY_EQUALITY_COLS,
     BOOLEAN_INT_COLS,
     DEFAULT_SNAPSHOT_DATE,
+    EVENT_MAPPING,
     ID_DROPS_POST_MERGE,
     LEAKAGE_DROPS_POST_MERGE,
     NOTIF_PREF_MAP,
@@ -287,6 +288,15 @@ def _zero_fill_after_merge(pp_df: pd.DataFrame, columns) -> None:
     pp_df[columns] = pp_df[columns].fillna(0)
 
 
+def _init_realtime_columns(pp_df: pd.DataFrame) -> None:
+    # Seed every rt_* column declared in EVENT_MAPPING to 0 so feature selection
+    # sees a stable schema regardless of whether events have flowed yet.
+    rt_cols = sorted({c for cols in EVENT_MAPPING.values() for c in cols if c.startswith('rt_')})
+    new_cols = [c for c in rt_cols if c not in pp_df.columns]
+    if new_cols:
+        pp_df[new_cols] = 0
+
+
 def _post_merge_clean(pp_df: pd.DataFrame) -> pd.DataFrame:
     if not pp_df[PRIMARY_ID].is_unique:
         n_dupes = int(pp_df[PRIMARY_ID].duplicated().sum())
@@ -364,4 +374,6 @@ def build_feature_frame(
     zero_fill_cols = [c for c in agg_cols if c not in PRESERVE_NAN_COLS]
     _zero_fill_after_merge(pp_df, zero_fill_cols)
 
-    return _post_merge_clean(pp_df)
+    pp_df = _post_merge_clean(pp_df)
+    _init_realtime_columns(pp_df)
+    return pp_df
